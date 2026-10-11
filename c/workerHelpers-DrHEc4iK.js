@@ -1,5 +1,5 @@
-/**
- * Copyright 2021 Google Inc. All Rights Reserved.
+/*
+ * Copyright 2022 Google Inc. All Rights Reserved.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -21,14 +21,14 @@
 function waitForMsgType(target, type) {
   return new Promise(resolve => {
     target.addEventListener('message', function onMsg({ data }) {
-      if (data == null || data.type !== type) return;
+      if (data?.type !== type) return;
       target.removeEventListener('message', onMsg);
       resolve(data);
     });
   });
 }
 
-waitForMsgType(self, 'wasm_bindgen_worker_init').then(async data => {
+waitForMsgType(self, 'wasm_bindgen_worker_init').then(async ({ init, receiver }) => {
   // # Note 1
   // Our JS should have been generated in
   // `[out-dir]/snippets/wasm-bindgen-rayon-[hash]/workerHelpers.js`,
@@ -52,47 +52,56 @@ waitForMsgType(self, 'wasm_bindgen_worker_init').then(async data => {
   // cheap since the requested file is already in cache (it was loaded by
   // the main thread).
   const pkg = await import('../../..');
-  await pkg.default(data.module, data.memory);
+  await pkg.default(init);
   postMessage({ type: 'wasm_bindgen_worker_ready' });
-  pkg.wbg_rayon_start_worker(data.receiver);
+  pkg.wbg_rayon_start_worker(receiver);
 });
 
+// Note: this is never used, but necessary to prevent a bug in Firefox
+// (https://bugzilla.mozilla.org/show_bug.cgi?id=1702191) where it collects
+// Web Workers that have a shared WebAssembly memory with the main thread,
+// but are not explicitly rooted via a `Worker` instance.
+//
+// By storing them in a variable, we can keep `Worker` objects around and
+// prevent them from getting GC-d.
+let _workers;
+
 export async function startWorkers(module, memory, builder) {
+  if (builder.numThreads() === 0) {
+    throw new Error(`num_threads must be > 0.`);
+  }
+
   const workerInit = {
     type: 'wasm_bindgen_worker_init',
-    module,
-    memory,
+    init: { module_or_path: module, memory },
     receiver: builder.receiver()
   };
 
-  try {
-    await Promise.all(
-      Array.from({ length: builder.numThreads() }, () => {
-        // Self-spawn into a new Worker.
-        //
-        // TODO: while `new URL('...', import.meta.url) becomes a semi-standard
-        // way to get asset URLs relative to the module across various bundlers
-        // and browser, ideally we should switch to `import.meta.resolve`
-        // once it becomes a standard.
-        //
-        // Note: we could use `../../..` as the URL here to inline workerHelpers.js
-        // into the parent entry instead of creating another split point -
-        // this would be preferable from optimization perspective -
-        // however, Webpack then eliminates all message handler code
-        // because wasm-pack produces "sideEffects":false in package.json
-        // unconditionally.
-        //
-        // The only way to work around that is to have side effect code
-        // in an entry point such as Worker file itself.
-        const worker = new Worker(new URL('./workerHelpers.js', import.meta.url), {
-          type: 'module'
-        });
-        worker.postMessage(workerInit);
-        return waitForMsgType(worker, 'wasm_bindgen_worker_ready');
-      })
-    );
-    builder.build();
-  } finally {
-    builder.free();
-  }
+  _workers = await Promise.all(
+    Array.from({ length: builder.numThreads() }, async () => {
+      // Self-spawn into a new Worker.
+      //
+      // TODO: while `new URL('...', import.meta.url) becomes a semi-standard
+      // way to get asset URLs relative to the module across various bundlers
+      // and browser, ideally we should switch to `import.meta.resolve`
+      // once it becomes a standard.
+      //
+      // Note: we could use `../../..` as the URL here to inline workerHelpers.js
+      // into the parent entry instead of creating another split point -
+      // this would be preferable from optimization perspective -
+      // however, Webpack then eliminates all message handler code
+      // because wasm-pack produces "sideEffects":false in package.json
+      // unconditionally.
+      //
+      // The only way to work around that is to have side effect code
+      // in an entry point such as Worker file itself.
+      const worker = new Worker(new URL('./workerHelpers.js', import.meta.url), {
+        type: 'module'
+      });
+      worker.postMessage(workerInit);
+      await waitForMsgType(worker, 'wasm_bindgen_worker_ready');
+      return worker;
+    })
+  );
+  builder.build();
 }
