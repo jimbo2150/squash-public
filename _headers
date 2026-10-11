@@ -1,5 +1,6 @@
 /*
   Cache-Control: no-cache
+  Vary: origin
 
 # I don't think Rollup is cache-busting files correctly.
 /c/*
